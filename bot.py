@@ -13,25 +13,24 @@ TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("Установи BOT_TOKEN в переменных окружения")
 
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
+SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "").strip()
+
 API = f"https://api.telegram.org/bot{TOKEN}"
 
-# Загружаем тексты арканов
 with open(os.path.join(os.path.dirname(__file__), "arcana_texts.json"), encoding="utf-8") as f:
     ARCANA = json.load(f)
 
-# Состояния пользователей: chat_id -> {"step": ..., "name": ..., ...}
 STATES = {}
 
-# ─── Логика расчёта ────────────────────────────────────────────────
 
 def reduce_arcana(n):
-    """Сводим число к ≤22 методом сложения цифр."""
     while n > 22:
         n = sum(int(d) for d in str(n))
     return 22 if n == 0 else n
 
+
 def calculate_finance(day, month, year):
-    """Авторская формула финансовой линии."""
     D = reduce_arcana(day)
     M_month = reduce_arcana(month)
     G = reduce_arcana(sum(int(d) for d in str(year)))
@@ -42,8 +41,8 @@ def calculate_finance(day, month, year):
     arcana_P = reduce_arcana(arcana_M + arcana_S)
     return arcana_M, arcana_S, arcana_P
 
+
 def parse_date(s):
-    """Разбор даты ДД.ММ.ГГГГ (с . / -)."""
     s = s.strip()
     m = re.match(r"^(\d{1,2})[.\/\-](\d{1,2})[.\/\-](\d{4})$", s)
     if not m:
@@ -53,12 +52,9 @@ def parse_date(s):
         return None
     return day, month, year
 
-# ─── Сборка финального поста ───────────────────────────────────────
 
 def build_post(name, M, S, P):
-    tM, tS, tP = str(M), str(S), str(P)
-    aM, aS, aP = ARCANA[tM], ARCANA[tS], ARCANA[tP]
-
+    aM, aS, aP = ARCANA[str(M)], ARCANA[str(S)], ARCANA[str(P)]
     post = (
         f"🔮 {name}, ТВОЙ ФИНАНСОВЫЙ КОД: {M} – {S} – {P}\n\n"
         f"Каждое число — это аркан Таро.\n"
@@ -99,20 +95,17 @@ def build_post(name, M, S, P):
     )
     return post
 
-# ─── Telegram API helpers ──────────────────────────────────────────
 
 def send_message(chat_id, text, reply_markup=None):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
-    # Telegram ограничивает сообщение 4096 символами — режем на куски
     if len(text) <= 4096:
         try:
             requests.post(f"{API}/sendMessage", json=payload, timeout=10)
         except Exception as e:
-            print("send error:", e)
+            print("send error:", e, flush=True)
         return
-    # большой текст — разбиваем по «——»
     parts, current = [], ""
     for chunk in text.split("\n"):
         if len(current) + len(chunk) + 1 > 4000:
@@ -124,13 +117,65 @@ def send_message(chat_id, text, reply_markup=None):
         parts.append(current)
     for p in parts:
         try:
-            requests.post(f"{API}/sendMessage",
-                          json={"chat_id": chat_id, "text": p}, timeout=10)
+            requests.post(f"{API}/sendMessage", json={"chat_id": chat_id, "text": p}, timeout=10)
             time.sleep(0.3)
         except Exception as e:
-            print("send error:", e)
+            print("send error:", e, flush=True)
 
-# ─── Обработка сообщений ───────────────────────────────────────────
+
+def log_lead(state, msg):
+    user = msg.get("from", {})
+    username = user.get("username", "")
+    user_id = user.get("id", "")
+    full_name = (user.get("first_name", "") + " " + user.get("last_name", "")).strip()
+
+    name = state.get("name", "")
+    birth = state.get("birth_date", "")
+    M, S, P = state.get("M"), state.get("S"), state.get("P")
+    code = f"{M}-{S}-{P}"
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    if ADMIN_CHAT_ID:
+        text = (
+            "🌟 НОВЫЙ ЛИД В БОТЕ\n\n"
+            f"Имя в боте: {name}\n"
+            f"ДР: {birth}\n"
+            f"Финансовый код: {code}\n"
+            f"  • {M} — мышление\n"
+            f"  • {S} — сфера\n"
+            f"  • {P} — поток\n\n"
+            f"Telegram: {full_name}"
+            + (f" (@{username})" if username else "")
+            + f"\nID: {user_id}\n"
+            f"Время: {ts}"
+        )
+        try:
+            requests.post(
+                f"{API}/sendMessage",
+                json={"chat_id": ADMIN_CHAT_ID, "text": text},
+                timeout=10,
+            )
+        except Exception as e:
+            print("admin notify error:", e, flush=True)
+
+    if SHEETS_WEBHOOK_URL:
+        try:
+            requests.post(
+                SHEETS_WEBHOOK_URL,
+                json={
+                    "timestamp": ts,
+                    "name": name,
+                    "birth_date": birth,
+                    "M": M, "S": S, "P": P, "code": code,
+                    "user_id": user_id,
+                    "username": username,
+                    "full_name": full_name,
+                },
+                timeout=5,
+            )
+        except Exception as e:
+            print("sheets error:", e, flush=True)
+
 
 def handle(update):
     msg = update.get("message")
@@ -196,26 +241,37 @@ def handle(update):
             "Я просто рядом 🫶",
             reply_markup={
                 "inline_keyboard": [[
-                    {"text": "💬 Написать Яне", "url": "https://t.me/yana_afonina"}
+                    {"text": "💬 Написать Яне", "url": "https://t.me/Neiya_Ya"}
                 ]]
             }
         )
+
+        try:
+            log_lead(state, msg)
+        except Exception as e:
+            print("log_lead error:", e, flush=True)
         return
 
     if state["step"] == "done":
         send_message(chat_id, "Если хочешь начать сначала — отправь /start")
         return
 
-# ─── Главный цикл ──────────────────────────────────────────────────
 
 def main():
-    print("Бот запущен. Long polling...")
+    print("Бот запущен. Long polling...", flush=True)
+    print(
+        f"admin_chat: {'есть' if ADMIN_CHAT_ID else 'нет'} | "
+        f"sheets: {'есть' if SHEETS_WEBHOOK_URL else 'нет'}",
+        flush=True,
+    )
     offset = 0
     while True:
         try:
-            r = requests.get(f"{API}/getUpdates",
-                             params={"timeout": 25, "offset": offset},
-                             timeout=30)
+            r = requests.get(
+                f"{API}/getUpdates",
+                params={"timeout": 25, "offset": offset},
+                timeout=30,
+            )
             data = r.json()
             if data.get("ok"):
                 for upd in data.get("result", []):
@@ -223,12 +279,14 @@ def main():
                     try:
                         handle(upd)
                     except Exception as e:
-                        print("handle error:", e)
+                        print("handle error:", e, flush=True)
         except requests.exceptions.Timeout:
             continue
         except Exception as e:
-            print("poll error:", e)
+            print("poll error:", e, flush=True)
             time.sleep(2)
+
 
 if __name__ == "__main__":
     main()
+      
