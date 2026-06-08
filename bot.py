@@ -18,11 +18,10 @@ SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "").strip()
 
 API = f"https://api.telegram.org/bot{TOKEN}"
 
-# URL картинки с надписью «Введи свою дату рождения».
-# Лежит в репозитории рядом с bot.py — Telegram сам её скачает.
 ENTER_DATE_PHOTO_URL = "https://raw.githubusercontent.com/NeiyaYa/financial-code-bot/main/enter_date.jpg"
 
-# Ссылка на практику «Корни денежного сценария» в канале Яны.
+CHANNEL_USERNAME = "@yana_afonina_neiya"
+CHANNEL_URL = "https://t.me/yana_afonina_neiya"
 PRACTICE_URL = "https://t.me/yana_afonina_neiya/2097"
 
 with open(os.path.join(os.path.dirname(__file__), "arcana_texts.json"), encoding="utf-8") as f:
@@ -60,10 +59,10 @@ def parse_date(s):
     return day, month, year
 
 
-def build_post(M, S, P):
+def build_post(name, M, S, P):
     aM, aS, aP = ARCANA[str(M)], ARCANA[str(S)], ARCANA[str(P)]
     post = (
-        f"🔮 ТВОЙ ФИНАНСОВЫЙ КОД: {M} – {S} – {P}\n\n"
+        f"🔮 {name}, ТВОЙ ФИНАНСОВЫЙ КОД: {M} – {S} – {P}\n\n"
         f"Каждое число — это аркан Таро.\n"
         f"И у каждого своя роль в твоих финансах.\n\n"
         f"——\n\n"
@@ -122,7 +121,6 @@ def send_message(chat_id, text, reply_markup=None):
 
 
 def send_photo(chat_id, photo_url, caption=None):
-    """Отправляем фото по URL. Если не получилось — шлём caption отдельным текстом."""
     payload = {"chat_id": chat_id, "photo": photo_url}
     if caption:
         payload["caption"] = caption
@@ -133,18 +131,47 @@ def send_photo(chat_id, photo_url, caption=None):
         print("photo error:", r.status_code, r.text[:200], flush=True)
     except Exception as e:
         print("photo error:", e, flush=True)
-    # Фолбэк — если фото не отправилось, шлём подпись текстом
     if caption:
         send_message(chat_id, caption)
     return False
 
 
-def log_lead(state, msg):
-    user = msg.get("from", {})
+def answer_callback(callback_id, text=None, show_alert=False):
+    payload = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = text
+    if show_alert:
+        payload["show_alert"] = True
+    try:
+        requests.post(f"{API}/answerCallbackQuery", json=payload, timeout=10)
+    except Exception as e:
+        print("callback answer error:", e, flush=True)
+
+
+def is_subscribed(user_id):
+    """Проверяем подписку через getChatMember. Бот должен быть админом канала."""
+    try:
+        r = requests.get(
+            f"{API}/getChatMember",
+            params={"chat_id": CHANNEL_USERNAME, "user_id": user_id},
+            timeout=10,
+        )
+        data = r.json()
+        if data.get("ok"):
+            status = data["result"].get("status", "left")
+            return status in ("member", "administrator", "creator")
+        print("subscription check failed:", data, flush=True)
+    except Exception as e:
+        print("subscription check error:", e, flush=True)
+    return False
+
+
+def log_lead(state, user):
     username = user.get("username", "")
     user_id = user.get("id", "")
     full_name = (user.get("first_name", "") + " " + user.get("last_name", "")).strip()
 
+    name = state.get("name", "")
     birth = state.get("birth_date", "")
     M, S, P = state.get("M"), state.get("S"), state.get("P")
     code = f"{M}-{S}-{P}"
@@ -153,6 +180,7 @@ def log_lead(state, msg):
     if ADMIN_CHAT_ID:
         text = (
             "🌟 НОВЫЙ ЛИД В БОТЕ\n\n"
+            f"Имя в боте: {name}\n"
             f"ДР: {birth}\n"
             f"Финансовый код: {code}\n"
             f"  • {M} — мышление\n"
@@ -178,7 +206,7 @@ def log_lead(state, msg):
                 SHEETS_WEBHOOK_URL,
                 json={
                     "timestamp": ts,
-                    "name": full_name,
+                    "name": name,
                     "birth_date": birth,
                     "M": M, "S": S, "P": P, "code": code,
                     "user_id": user_id,
@@ -198,20 +226,56 @@ WELCOME = (
     "Ты можешь это сделать, зная и правильно используя свои сильные и слабые стороны "
     "по дате рождения. И я готова тебе их раскрыть.\n\n"
     "Сейчас покажу твой финансовый код — три аркана, которые управляют твоими деньгами.\n\n"
-    "Изучай прямо сейчас 👇"
+    "Изучай прямо сейчас 👇\n\n"
+    "Как мне к тебе обращаться?"
 )
-
-DATE_CAPTION = "📆 Введи свою дату рождения\n\nВ формате ДД.ММ.ГГГГ (например: 11.03.1981)"
 
 PRACTICE_PROMO = (
     "А пока, дорогая, можешь забрать ПРАКТИКУ «Корни денежного сценария» ☀️\n\n"
     "Отдаю её тебе за простое действие — подписку на мой личный ТГ-канал, "
     "там много полезной информации и практик.\n\n"
-    "Когда подпишешься — ОБЯЗАТЕЛЬНО возвращайся в бота 🍀"
+    "1️⃣ Жми «Подписаться на канал»\n"
+    "2️⃣ Возвращайся и жми «Я подписалась — проверить»\n\n"
+    "И я открою тебе доступ к практике 🍀"
 )
 
 
+def handle_callback(cb):
+    cb_id = cb.get("id")
+    user = cb.get("from", {})
+    user_id = user.get("id")
+    data = cb.get("data", "")
+    msg = cb.get("message") or {}
+    chat_id = msg.get("chat", {}).get("id")
+
+    if data == "check_sub":
+        if not chat_id:
+            answer_callback(cb_id)
+            return
+        if is_subscribed(user_id):
+            answer_callback(cb_id, "Подписка подтверждена! 🌟")
+            send_message(
+                chat_id,
+                "Готово, моя хорошая 🤍\n\nДержи свою практику 👇",
+                reply_markup={
+                    "inline_keyboard": [[
+                        {"text": "🎁 Забрать практику", "url": PRACTICE_URL}
+                    ]]
+                }
+            )
+        else:
+            answer_callback(
+                cb_id,
+                "Подписки пока не вижу 🙈\nПодпишись на канал и нажми снова",
+                show_alert=True,
+            )
+
+
 def handle(update):
+    if "callback_query" in update:
+        handle_callback(update["callback_query"])
+        return
+
     msg = update.get("message")
     if not msg or "text" not in msg:
         return
@@ -220,10 +284,17 @@ def handle(update):
     state = STATES.get(chat_id, {"step": "start"})
 
     if text == "/start" or state["step"] == "start":
-        STATES[chat_id] = {"step": "ask_date"}
+        STATES[chat_id] = {"step": "ask_name"}
         send_message(chat_id, WELCOME)
-        time.sleep(0.5)
-        send_photo(chat_id, ENTER_DATE_PHOTO_URL, caption=DATE_CAPTION)
+        return
+
+    if state["step"] == "ask_name":
+        state["name"] = text[:50]
+        state["step"] = "ask_date"
+        STATES[chat_id] = state
+        time.sleep(0.3)
+        caption = f"{state['name']}, введи свою дату рождения 📆\n\nВ формате ДД.ММ.ГГГГ (например: 11.03.1981)"
+        send_photo(chat_id, ENTER_DATE_PHOTO_URL, caption=caption)
         return
 
     if state["step"] == "ask_date":
@@ -245,21 +316,22 @@ def handle(update):
         state["step"] = "done"
         STATES[chat_id] = state
 
-        post = build_post(M, S, P)
+        post = build_post(state["name"], M, S, P)
         send_message(chat_id, post)
         time.sleep(1)
         send_message(
             chat_id,
             PRACTICE_PROMO,
             reply_markup={
-                "inline_keyboard": [[
-                    {"text": "🎁 Забрать практику", "url": PRACTICE_URL}
-                ]]
+                "inline_keyboard": [
+                    [{"text": "📢 Подписаться на канал", "url": CHANNEL_URL}],
+                    [{"text": "✅ Я подписалась — проверить", "callback_data": "check_sub"}],
+                ]
             }
         )
 
         try:
-            log_lead(state, msg)
+            log_lead(state, msg.get("from", {}))
         except Exception as e:
             print("log_lead error:", e, flush=True)
         return
@@ -277,11 +349,12 @@ def main():
         flush=True,
     )
     offset = 0
+    allowed = ["message", "callback_query"]
     while True:
         try:
             r = requests.get(
                 f"{API}/getUpdates",
-                params={"timeout": 25, "offset": offset},
+                params={"timeout": 25, "offset": offset, "allowed_updates": json.dumps(allowed)},
                 timeout=30,
             )
             data = r.json()
